@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  # Every pushed branch, not only main. A stacked pull request whose base is
+  # another feature branch does not match `pull_request: branches: [main]`, so
+  # with the previous filter the second and later reviews in a chain ran with
+  # no CI at all — which looks identical to CI passing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest--arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    steps:
+    - name: Check out source
+      uses: actions/checkout@v6
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '17'
+        cache: maven
+
+    - name: Verify shell syntax
+      run: |
+        bash -n llm-inference/smoke-test.sh
+        bash -n tools/check-format.sh
+
+      # GitHub's macOS runners ship without Docker. `compose config` only
+      # parses and validates the file and needs no daemon, so the standalone
+      # Compose binary runs the same check there.
+    - name: Install Docker Compose (macOS)
+      if: runner.os == 'macOS'
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      run: brew install docker-compose
+
+    - name: Validate Compose configuration
+      shell: bash
+      run: |
+        if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+          docker compose config --quiet
+        else
+          docker-compose config --quiet
+        fi
+
+      # Runs before the build so a whitespace failure reports in two seconds
+      # rather than after a four-minute compile.
+    - name: Check formatting
+      run: ./tools/check-format.sh
+
+      # JaCoCo's threshold is enforced in the verify phase, so a coverage
+      # failure reports last, after the tests it depends on.
+    - name: Build and test
+      run: ./mvnw --batch-mode --no-transfer-progress clean verify
+
+      # Uploaded even on failure: a coverage gate that fails without showing
+      # which lines are uncovered costs the reviewer their next twenty minutes.
+    - name: Upload coverage report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: jacoco-report
+        path: '**/target/site/jacoco/'
+        if-no-files-found: warn
+        retention-days: 7
+
+    - name: Upload test reports
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: surefire-reports
+        path: '**/target/surefire-reports/'
+        if-no-files-found: warn
+        retention-days: 7
+    name: build [${{ matrix.expander_leg }}]
